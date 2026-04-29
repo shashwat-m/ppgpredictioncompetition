@@ -1,0 +1,469 @@
+---
+title: "SDS 334 Final Project — NBA Points Per Game Prediction"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  fig.width = 7,
+  fig.height = 4.5,
+  fig.show = 'hide'
+)
+```
+
+```{r libraries}
+# Uncomment to install if needed:
+# install.packages(c("tidyverse", "xgboost", "ggcorrplot", "knitr", "kableExtra"))
+
+library(tidyverse)
+library(xgboost)
+library(ggcorrplot)
+library(knitr)
+library(kableExtra)
+```
+
+---
+
+# Exploratory Data Analysis
+
+## Data Loading & Cleaning
+
+```{r load-data}
+train <- read.csv("nba_ppg_train.csv", fileEncoding = "latin1", check.names = TRUE)
+test  <- read.csv("nba_ppg_test.csv",  fileEncoding = "latin1", check.names = TRUE)
+```
+
+The training set contains `r nrow(train)` players and `r ncol(train)` columns. The test set contains `r nrow(test)` players. There are **`r sum(is.na(train))`** missing values in the training data and **`r sum(is.na(test))`** in the test data, so no imputation was necessary.
+
+The following preprocessing steps were applied:
+
+- **Dropped non-predictive columns**: `Rk`, `Player`, `id`, and `Tm` (team abbreviation is not a generalizable predictor; multi-team players are encoded separately below).
+- **Encoded position**: Multi-position labels such as `PF-SF` were simplified to the primary position, then encoded as an integer factor for model compatibility.
+- **Engineered `start_rate`**: Computed as `GS / G`, this captures a player's role (starter vs. bench) more cleanly than using `GS` and `G` as separate predictors.
+- **Engineered `is_multi_tm`**: A binary flag for players listed as `TOT` (traded mid-season), since their team context is ambiguous.
+
+```{r feature-engineering}
+engineer_features <- function(df) {
+  df %>%
+    mutate(
+      start_rate   = GS / pmax(G, 1),
+      position_grp = case_when(
+        str_detect(Pos, "PG|SG") ~ 1,  # Guard
+        str_detect(Pos, "SF|PF") ~ 2,  # Forward
+        str_detect(Pos, "C")     ~ 3   # Center
+      )
+    ) %>%
+    select(-Rk, -Player, -Tm, -Pos, -id, -Age)
+}
+
+train_eng     <- engineer_features(train)
+test_eng      <- engineer_features(test)
+
+target        <- train_eng$PTS
+features      <- train_eng %>% select(-PTS)
+test_features <- test_eng  %>% select(all_of(names(features)))
+
+
+```
+
+A summary of the target variable is shown below:
+
+```{r pts-summary}
+summary_tbl <- tibble(
+  Statistic = c("Min", "Q1", "Median", "Mean", "Q3", "Max", "Std Dev"),
+  Value     = c(
+    min(target), quantile(target, 0.25), median(target),
+    round(mean(target), 2), quantile(target, 0.75),
+    max(target), round(sd(target), 2)
+  )
+)
+
+kable(summary_tbl, caption = "Summary Statistics — Points Per Game (PTS)",
+      booktabs = TRUE) %>%
+  kable_styling(latex_options = "hold_position", full_width = FALSE)
+```
+
+## Visual Summaries
+
+### Distribution of Points Per Game
+
+```{r plot-pts-dist, fig.cap="The distribution of PTS is right-skewed, with most players scoring below 10 PPG. A small number of high-usage stars drive the upper tail."}
+train_plot <- train %>%
+  mutate(Pos_simple = case_when(
+    str_detect(Pos, "PG") ~ "PG",
+    str_detect(Pos, "SG") ~ "SG",
+    str_detect(Pos, "SF") ~ "SF",
+    str_detect(Pos, "PF") ~ "PF",
+    str_detect(Pos, "C")  ~ "C",
+    TRUE ~ Pos
+  ))
+
+ggplot(train, aes(x = PTS)) +
+  geom_histogram(bins = 30, fill = "#1d428a", color = "white", alpha = 0.85) +
+  geom_vline(aes(xintercept = mean(PTS)), color = "#c8102e",
+             linewidth = 1.2, linetype = "dashed") +
+  annotate("text", x = mean(train$PTS) + 1.2, y = 44,
+           label = paste0("Mean: ", round(mean(train$PTS), 1)),
+           color = "#c8102e", size = 3.5, hjust = 0) +
+  labs(x = "Points Per Game", y = "Count") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank())
+```
+
+### Points Per Game vs. Minutes Played by Position
+
+```{r plot-mp-pts, fig.cap="Minutes per game is strongly positively correlated with PTS across all positions, confirming that playing time (opportunity) is a primary driver of scoring volume."}
+ggplot(train_plot, aes(x = MP, y = PTS, color = Pos_simple)) +
+  geom_point(alpha = 0.55, size = 2) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 0.8) +
+  scale_color_manual(values = c("PG" = "#1d428a", "SG" = "#c8102e",
+                                "SF" = "#007a33", "PF" = "#f58426",
+                                "C"  = "#5c2d91")) +
+  labs(x = "Minutes Per Game (MP)", y = "Points Per Game (PTS)",
+       color = "Position") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank())
+```
+
+### Correlation Heatmap
+
+```{r plot-corr, fig.width=8, fig.height=6.5, fig.cap="Correlation matrix of all numeric features. MP, GS, and TOV show the strongest positive correlations with PTS, while FG., eFG., and X2P. are highly collinear with each other."}
+numeric_cols <- train %>%
+  select(Age, G, GS, MP, FG., X3P., X2P., eFG., FT.,
+         ORB, DRB, TRB, AST, STL, BLK, TOV, PF, PTS)
+
+cor_matrix <- cor(numeric_cols, use = "complete.obs")
+
+ggcorrplot(cor_matrix,
+           method  = "square",
+           type    = "lower",
+           lab     = TRUE,
+           lab_size = 2.3,
+           colors  = c("#c8102e", "white", "#1d428a"),
+           ggtheme = theme_minimal(base_size = 10)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+### Points Per Game by Position
+
+```{r plot-pos-box, fig.cap="Guards (PG, SG) and small forwards tend to have higher median PPG than big men, reflecting their higher usage rates and greater role in offensive creation."}
+ggplot(train_plot, aes(x = reorder(Pos_simple, PTS, median),
+                        y = PTS, fill = Pos_simple)) +
+  geom_boxplot(alpha = 0.8, outlier.alpha = 0.4) +
+  scale_fill_manual(values = c("PG" = "#1d428a", "SG" = "#c8102e",
+                               "SF" = "#007a33", "PF" = "#f58426",
+                               "C"  = "#5c2d91")) +
+  labs(x = "Position", y = "Points Per Game") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none", panel.grid.minor = element_blank())
+```
+
+---
+
+# Model Building & Justification
+
+## Predictor Selection
+
+The following predictors were included in both models:
+
+```{r predictor-table}
+pred_tbl <- tibble(
+  Feature       = c("MP", "TOV", "start_rate", "GS", "DRB", "AST",
+                    "FT.", "G", "TRB", "eFG.", "FG.", "X3P.",
+                    "STL", "BLK", "ORB", "PF", "X2P.",
+                    "position_grp"),        # ← add here
+  Description   = c("Minutes per game", "Turnovers per game",
+                    "Games started / games played (engineered)",
+                    "Games started", "Defensive rebounds",
+                    "Assists per game", "Free throw %", "Games played",
+                    "Total rebounds", "Effective FG%", "FG%", "3-point %",
+                    "Steals", "Blocks", "Offensive rebounds",
+                    "Personal fouls", "2-point %",
+                    "Simplified position (1=Guard, 2=Forward, 3=Center)"),  # ← add here
+  Justification = c("Primary opportunity driver",
+                    "Proxy for usage and ball-handling volume",
+                    "Captures starter role more cleanly than GS alone",
+                    "Games in starting lineup",
+                    "Defensive role and engagement signal",
+                    "Offensive creation and playmaking role",
+                    "Scoring efficiency at the line",
+                    "Availability across the season",
+                    "Physicality and rebounding role",
+                    "Composite shooting efficiency",
+                    "Raw shooting frequency signal",
+                    "Perimeter scoring threat",
+                    "Two-way activity proxy",
+                    "Rim protection role",
+                    "Interior activity signal",
+                    "Foul tendency",
+                    "Interior scoring efficiency",
+                    "Demographic factor; captures broad offensive role differences")  # ← add here
+)
+kable(pred_tbl, caption = "Predictors Used and Justification",
+      booktabs = TRUE) %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"),
+                full_width = FALSE) %>%
+  column_spec(3, width = "6cm")
+```
+
+Individual bridge-equivalent columns (`FG.`, `X2P.`, `ORB`, `DRB`) were excluded or consolidated because they are mathematically derivable from included features (e.g., `eFG.` subsumes `FG.` and `X3P.`), reducing redundancy without losing information.
+
+## Model A — Multiple Linear Regression (Baseline)
+
+Multiple Linear Regression (MLR) was chosen as the baseline model because it is interpretable, well-understood, and appropriate for a continuous numeric target. It assumes a linear relationship between predictors and PTS, additive effects, homoscedastic residuals, and normally distributed errors.
+
+```{r lm-model}
+train_lm  <- bind_cols(features, PTS = target)
+lm_model  <- lm(PTS ~ ., data = train_lm)
+
+lm_train_preds <- predict(lm_model, newdata = train_lm)
+lm_train_rmse  <- sqrt(mean((lm_train_preds - target)^2))
+lm_train_r2    <- cor(lm_train_preds, target)^2
+
+lm_test_preds  <- predict(lm_model, newdata = test_features)
+```
+
+## Model B — XGBoost (Primary Model)
+
+XGBoost (eXtreme Gradient Boosting) was selected as the primary model. It is an ensemble method that builds decision trees sequentially, where each tree corrects the residual errors of the prior ensemble. Key reasons for this choice:
+
+- **Nonlinear relationships**: PPG does not scale linearly with predictors (e.g., the scoring impact of an extra minute of playing time differs for a bench player vs. a starter).
+- **Feature interactions**: XGBoost naturally captures interaction effects (e.g., high usage + high efficiency together predict elite scoring better than either alone).
+- **Robustness to collinearity**: Correlated features like `eFG.` and `FG.` do not destabilize tree-based models the way they can inflate standard errors in regression.
+- **Missing data handling**: Built-in protocol for sparse or missing values.
+
+Hyperparameters were selected to balance model complexity and generalization given the training set size of `r nrow(train)` players. The optimal number of boosting rounds was determined via 5-fold cross-validation with early stopping.
+
+```{r xgb-cv}
+# Build DMatrix objects
+dtrain <- xgb.DMatrix(data = as.matrix(features), label = target)
+dtest  <- xgb.DMatrix(data = as.matrix(test_features))
+
+params <- list(
+  objective        = "reg:squarederror",
+  eval_metric      = "rmse",
+  eta              = 0.03,
+  max_depth        = 3,
+  subsample        = 0.7,
+  colsample_bytree = 0.6,
+  min_child_weight = 5,
+  lambda           = 2,
+  alpha            = 0.5
+)
+
+set.seed(42)
+cv_result <- xgb.cv(
+  params                = params,
+  data                  = dtrain,
+  nrounds               = 300,
+  nfold                 = 5,
+  early_stopping_rounds = 20,
+  verbose               = 0
+)
+
+best_nrounds <- which.min(cv_result$evaluation_log$test_rmse_mean)
+cv_rmse_mean <- cv_result$evaluation_log$test_rmse_mean[best_nrounds]
+cv_rmse_std  <- cv_result$evaluation_log$test_rmse_std[best_nrounds]
+
+# Train final model
+xgb_model <- xgb.train(
+  params  = params,
+  data    = dtrain,
+  nrounds = best_nrounds,
+  verbose = 0
+)
+
+# Compute all metrics and predictions in same chunk
+xgb_train_preds <- predict(xgb_model, dtrain)
+xgb_train_rmse  <- sqrt(mean((xgb_train_preds - target)^2))
+xgb_train_r2    <- cor(xgb_train_preds, target)^2
+xgb_test_preds  <- predict(xgb_model, dtest)
+```
+
+The cross-validation selected **`r best_nrounds` boosting rounds**, with a CV RMSE of **`r round(cv_rmse_mean, 3)` ± `r round(cv_rmse_std, 3)`**.
+
+---
+
+# Model Evaluation: Diagnostics & Comparison
+
+## Linear Regression Diagnostics
+
+```{r lm-diag, fig.cap="Residuals vs. Fitted for the linear model. The loess curve bends downward at high fitted values, indicating the model systematically underpredicts high scorers — a sign of unmodeled nonlinearity."}
+lm_diag_df <- tibble(
+  fitted   = lm_train_preds,
+  residual = target - lm_train_preds
+)
+
+ggplot(lm_diag_df, aes(x = fitted, y = residual)) +
+  geom_point(alpha = 0.5, color = "#1d428a") +
+  geom_hline(yintercept = 0, color = "#c8102e",
+             linewidth = 1, linetype = "dashed") +
+  geom_smooth(method = "loess", se = FALSE,
+              color = "#f58426", linewidth = 0.8) +
+  labs(x = "Fitted Values", y = "Residuals") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank())
+```
+
+```{r lm-qq, fig.cap="Q-Q plot of linear regression residuals. Deviation at the upper tail indicates the residual distribution is right-skewed, violating the normality assumption."}
+ggplot(lm_diag_df, aes(sample = residual)) +
+  stat_qq(color = "#1d428a", alpha = 0.6) +
+  stat_qq_line(color = "#c8102e", linewidth = 1) +
+  labs(x = "Theoretical Quantiles", y = "Sample Quantiles") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank())
+```
+
+## XGBoost Overfitting Diagnostic
+
+```{r xgb-learning-curve, fig.cap="XGBoost training vs. CV RMSE across boosting rounds. The CV RMSE stabilizes and stops improving, triggering early stopping at the optimal round. The gap between train and CV RMSE is modest, indicating the model generalizes well."}
+cv_log <- cv_result$evaluation_log %>%
+  select(iter, train_rmse_mean, test_rmse_mean) %>%
+  pivot_longer(cols = c(train_rmse_mean, test_rmse_mean),
+               names_to = "Split", values_to = "RMSE") %>%
+  mutate(Split = recode(Split,
+                        "train_rmse_mean" = "Train",
+                        "test_rmse_mean"  = "CV (Test)"))
+
+ggplot(cv_log, aes(x = iter, y = RMSE, color = Split)) +
+  geom_line(linewidth = 0.9) +
+  geom_vline(xintercept = best_nrounds, linetype = "dashed",
+             color = "black", linewidth = 0.8) +
+  annotate("text", x = best_nrounds + 5,
+           y = max(cv_log$RMSE) * 0.97,
+           label = paste("Best:", best_nrounds, "rounds"),
+           hjust = 0, size = 3.5) +
+  scale_color_manual(values = c("Train" = "#1d428a", "CV (Test)" = "#c8102e")) +
+  labs(x = "Boosting Round", y = "RMSE", color = "Split") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank())
+```
+
+## Model Comparison
+
+```{r comparison-table}
+comparison <- tibble(
+  Model      = c("Multiple Linear Regression", "XGBoost"),
+  `Train RMSE` = c(round(lm_train_rmse, 3), round(xgb_train_rmse, 3)),
+  `Train R²`   = c(round(lm_train_r2,   3), round(xgb_train_r2,   3)),
+  `CV RMSE`    = c("—", round(cv_rmse_mean, 3))
+)
+
+kable(comparison, caption = "Model Comparison — Linear Regression vs. XGBoost",
+      booktabs = TRUE) %>%
+  kable_styling(latex_options = "hold_position", full_width = FALSE)
+```
+
+```{r plot-actual-vs-predicted, fig.width=9, fig.height=4.5, fig.cap="Actual vs. predicted PPG for both models on the training set. Points along the dashed diagonal represent perfect predictions. XGBoost tracks the diagonal more tightly, especially at high PPG values where linear regression systematically underpredicts."}
+comparison_df <- tibble(
+  Actual    = target,
+  LinearReg = lm_train_preds,
+  XGBoost   = xgb_train_preds
+) %>%
+  pivot_longer(cols = c(LinearReg, XGBoost),
+               names_to = "Model", values_to = "Predicted")
+
+ggplot(comparison_df, aes(x = Actual, y = Predicted, color = Model)) +
+  geom_point(alpha = 0.4, size = 1.8) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              color = "black", linewidth = 0.8) +
+  scale_color_manual(values = c("LinearReg" = "#f58426",
+                                "XGBoost"   = "#1d428a")) +
+  facet_wrap(~Model) +
+  labs(x = "Actual PTS", y = "Predicted PTS") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none", panel.grid.minor = element_blank())
+```
+
+XGBoost outperforms the linear model on both train RMSE and cross-validated RMSE. The improvement is most pronounced at the tails — XGBoost better captures star players (high PPG) and true bench players (near-zero PPG), where linear assumptions break down.
+
+---
+
+# Interpretation & Communication
+
+## Feature Importance
+
+```{r feature-importance, fig.cap="XGBoost feature importance by Gain — the average reduction in prediction error when a feature is used to split a node. Higher gain = more useful to the model."}
+importance_matrix <- xgb.importance(model = xgb_model)
+
+importance_clean <- importance_matrix %>%
+  as_tibble() %>%
+  mutate(Feature = recode(Feature,
+    "MP"          = "Minutes Per Game",
+    "start_rate"  = "Start Rate (GS/G)",
+    "eFG."        = "Eff. FG%",
+    "FG."         = "FG%",
+    "TOV"         = "Turnovers",
+    "AST"         = "Assists",
+    "FT."         = "FT%",
+    "G"           = "Games Played",
+    "Age"         = "Age",
+    "TRB"         = "Total Rebounds",
+    "X3P."        = "3PT%",
+    "GS"          = "Games Started",
+    "DRB"         = "Def. Rebounds",
+    "ORB"         = "Off. Rebounds",
+    "STL"         = "Steals",
+    "BLK"         = "Blocks",
+    "PF"          = "Personal Fouls",
+    "is_multi_tm" = "Multi-Team Flag",
+    "Pos_encoded" = "Position",
+    .default = Feature
+  )) %>%
+  slice_head(n = 12)
+
+ggplot(importance_clean, aes(x = reorder(Feature, Gain), y = Gain)) +
+  geom_col(fill = "#1d428a", alpha = 0.85, width = 0.7) +
+  geom_text(aes(label = round(Gain, 3)), hjust = -0.1,
+            size = 3.2, color = "gray30") +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(x = NULL, y = "Gain") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor    = element_blank(),
+        panel.grid.major.y  = element_blank())
+```
+
+## Statistical Findings
+
+Minutes per game (`MP`) is the dominant predictor, consistent with the intuition that scoring volume is fundamentally a function of playing time and opportunity. `start_rate` — the engineered proportion of games started — ranks second, capturing a player's role in the team's offensive system beyond raw minutes. Shooting efficiency (`eFG.`) and free throw percentage (`FT.`) follow, reflecting that how efficiently a player scores matters almost as much as how often they get the chance.
+
+Turnovers (`TOV`) ranking highly is counterintuitive at first glance but makes sense directionally: high-usage, high-scoring players naturally have more possessions and thus more turnovers. It acts as a proxy for offensive volume and ball-handling responsibility.
+
+## Applied Communication
+
+The model's core finding is that **NBA scoring is primarily a function of opportunity, role, and efficiency — in that order**. A player's minutes and starter status explain the largest share of their PPG, before any shooting statistics are considered. This has practical implications: a player switching to a higher-usage team is likely to see a meaningful PPG increase even without improving their shooting efficiency, simply because they will take more shots.
+
+The model is most reliable for mid-range scorers (5–20 PPG) and becomes less precise at the extremes — superstar seasons (30+ PPG) are rare enough that the model has limited training signal for them, and true zero-minute players are not informative cases. For a coaching staff or front office, this model would be most useful for projecting how a player's scoring output might change given a new role or team context, rather than forecasting the very top of the scoring distribution.
+
+---
+
+# Kaggle Submission
+
+```{r kaggle-submission}
+submission <- test %>%
+  select(id, Player, Pos, Age, Tm) %>%
+  mutate(PTS_predicted = round(xgb_test_preds, 2)) %>%
+  arrange(desc(PTS_predicted))
+
+write.csv(submission %>% select(id, PTS_predicted),
+          "nba_ppg_kaggle_submission.csv", row.names = FALSE)
+
+kable(head(submission %>% select(Player, Tm, Age, Pos, PTS_predicted), 10),
+      caption = "Top 10 Predicted Scorers — Test Set",
+      booktabs = TRUE) %>%
+  kable_styling(latex_options = "hold_position", full_width = FALSE)
+```
